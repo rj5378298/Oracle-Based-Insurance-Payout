@@ -8,12 +8,16 @@
 (define-constant err-oracle-not-authorized (err u106))
 (define-constant err-invalid-data (err u107))
 (define-constant err-payout-already-processed (err u108))
+(define-constant err-insufficient-consensus (err u109))
+(define-constant err-oracle-already-registered (err u110))
 
 (define-data-var next-policy-id uint u1)
 (define-data-var oracle-address principal tx-sender)
 (define-data-var oracle-fee uint u1000000)
 (define-data-var min-premium uint u5000000)
 (define-data-var max-payout-ratio uint u300)
+(define-data-var min-consensus-weight uint u100)
+(define-data-var total-oracle-weight uint u0)
 
 (define-map policies 
     { policy-id: uint }
@@ -47,6 +51,34 @@
         claim-timestamp: uint,
         data-used: uint,
         processed: bool
+    }
+)
+
+(define-map registered-oracles
+    { oracle: principal }
+    {
+        weight: uint,
+        active: bool,
+        total-reports: uint
+    }
+)
+
+(define-map oracle-reports
+    { data-key: (string-ascii 20), oracle: principal }
+    {
+        value: uint,
+        timestamp: uint,
+        block-height: uint
+    }
+)
+
+(define-map consensus-data
+    { data-key: (string-ascii 20) }
+    {
+        consensus-value: uint,
+        total-weight: uint,
+        report-count: uint,
+        last-updated: uint
     }
 )
 
@@ -201,6 +233,119 @@
     )
 )
 
+(define-public (register-oracle (oracle principal) (weight uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> weight u0) err-invalid-data)
+        (asserts! (is-none (map-get? registered-oracles { oracle: oracle })) err-oracle-already-registered)
+        
+        (map-set registered-oracles
+            { oracle: oracle }
+            {
+                weight: weight,
+                active: true,
+                total-reports: u0
+            }
+        )
+        
+        (var-set total-oracle-weight (+ (var-get total-oracle-weight) weight))
+        (ok true)
+    )
+)
+
+(define-public (deactivate-oracle (oracle principal))
+    (let ((oracle-info (unwrap! (map-get? registered-oracles { oracle: oracle }) err-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get active oracle-info) err-policy-not-active)
+        
+        (map-set registered-oracles
+            { oracle: oracle }
+            (merge oracle-info { active: false })
+        )
+        
+        (var-set total-oracle-weight (- (var-get total-oracle-weight) (get weight oracle-info)))
+        (ok true)
+    )
+)
+
+(define-public (submit-oracle-report (data-key (string-ascii 20)) (value uint))
+    (let ((oracle-info (unwrap! (map-get? registered-oracles { oracle: tx-sender }) err-oracle-not-authorized)))
+        (asserts! (get active oracle-info) err-policy-not-active)
+        (asserts! (> value u0) err-invalid-data)
+        
+        (map-set oracle-reports
+            { data-key: data-key, oracle: tx-sender }
+            {
+                value: value,
+                timestamp: burn-block-height,
+                block-height: burn-block-height
+            }
+        )
+        
+        (map-set registered-oracles
+            { oracle: tx-sender }
+            (merge oracle-info { total-reports: (+ (get total-reports oracle-info) u1) })
+        )
+        
+        (unwrap-panic (update-consensus-data data-key))
+        (ok true)
+    )
+)
+
+(define-public (submit-consensus-claim (policy-id uint) (data-key (string-ascii 20)))
+    (let 
+        (
+            (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+            (consensus-info (unwrap! (map-get? consensus-data { data-key: data-key }) err-not-found))
+        )
+        (asserts! (is-eq (get policyholder policy) tx-sender) err-owner-only)
+        (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+        (asserts! (> (get end-block policy) burn-block-height) err-policy-expired)
+        (asserts! (not (get payout-processed policy)) err-payout-already-processed)
+        (asserts! (>= (get total-weight consensus-info) (var-get min-consensus-weight)) err-insufficient-consensus)
+        
+        (let ((condition-met (evaluate-condition 
+                (get consensus-value consensus-info)
+                (get trigger-condition policy)
+                (get trigger-operator policy))))
+            (if condition-met
+                (let 
+                    (
+                        (payout-amount (calculate-payout-amount policy-id (get consensus-value consensus-info)))
+                        (contract-balance (stx-get-balance (as-contract tx-sender)))
+                    )
+                    (asserts! (>= contract-balance payout-amount) err-insufficient-funds)
+                    
+                    (map-set policy-claims
+                        { policy-id: policy-id }
+                        {
+                            claim-amount: payout-amount,
+                            claim-timestamp: burn-block-height,
+                            data-used: (get consensus-value consensus-info),
+                            processed: true
+                        }
+                    )
+                    
+                    (map-set policies
+                        { policy-id: policy-id }
+                        (merge policy { status: "paid-out", payout-processed: true })
+                    )
+                    
+                    (try! (as-contract (stx-transfer? payout-amount tx-sender (get policyholder policy))))
+                    (ok payout-amount)
+                )
+                (begin
+                    (map-set policies
+                        { policy-id: policy-id }
+                        (merge policy { status: "expired", payout-processed: true })
+                    )
+                    (ok u0)
+                )
+            )
+        )
+    )
+)
+
 (define-read-only (calculate-premium (coverage-amount uint) (duration-blocks uint))
     (let 
         (
@@ -291,4 +436,89 @@
 
 (define-read-only (get-min-premium)
     (var-get min-premium)
+)
+
+(define-private (update-consensus-data (data-key (string-ascii 20)))
+    (let 
+        (
+            (current-consensus (map-get? consensus-data { data-key: data-key }))
+            (weighted-sum u0)
+            (total-weight u0)
+            (report-count u0)
+        )
+        (let ((consensus-result (calculate-consensus data-key weighted-sum total-weight report-count)))
+            (map-set consensus-data
+                { data-key: data-key }
+                {
+                    consensus-value: (get consensus-value consensus-result),
+                    total-weight: (get total-weight consensus-result),
+                    report-count: (get report-count consensus-result),
+                    last-updated: burn-block-height
+                }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (calculate-consensus (data-key (string-ascii 20)) (weighted-sum uint) (total-weight uint) (report-count uint))
+    (let 
+        (
+            (oracle-list (get-oracle-list))
+            (final-weighted-sum (fold sum-weighted-reports oracle-list { data-key: data-key, weighted-sum: u0, total-weight: u0, report-count: u0 }))
+        )
+        (let ((consensus-value (if (> (get total-weight final-weighted-sum) u0)
+                                   (/ (get weighted-sum final-weighted-sum) (get total-weight final-weighted-sum))
+                                   u0)))
+            {
+                consensus-value: consensus-value,
+                total-weight: (get total-weight final-weighted-sum),
+                report-count: (get report-count final-weighted-sum)
+            }
+        )
+    )
+)
+
+(define-private (sum-weighted-reports (oracle principal) (acc { data-key: (string-ascii 20), weighted-sum: uint, total-weight: uint, report-count: uint }))
+    (let 
+        (
+            (oracle-info (map-get? registered-oracles { oracle: oracle }))
+            (report (map-get? oracle-reports { data-key: (get data-key acc), oracle: oracle }))
+        )
+        (if (and (is-some oracle-info) (is-some report) (get active (unwrap-panic oracle-info)))
+            {
+                data-key: (get data-key acc),
+                weighted-sum: (+ (get weighted-sum acc) (* (get value (unwrap-panic report)) (get weight (unwrap-panic oracle-info)))),
+                total-weight: (+ (get total-weight acc) (get weight (unwrap-panic oracle-info))),
+                report-count: (+ (get report-count acc) u1)
+            }
+            acc
+        )
+    )
+)
+
+(define-private (get-oracle-list)
+    (list 
+        (var-get oracle-address)
+    )
+)
+
+(define-read-only (get-consensus-data (data-key (string-ascii 20)))
+    (map-get? consensus-data { data-key: data-key })
+)
+
+(define-read-only (get-oracle-info (oracle principal))
+    (map-get? registered-oracles { oracle: oracle })
+)
+
+(define-read-only (get-oracle-report (data-key (string-ascii 20)) (oracle principal))
+    (map-get? oracle-reports { data-key: data-key, oracle: oracle })
+)
+
+(define-read-only (get-total-oracle-weight)
+    (var-get total-oracle-weight)
+)
+
+(define-read-only (get-min-consensus-weight)
+    (var-get min-consensus-weight)
 )
