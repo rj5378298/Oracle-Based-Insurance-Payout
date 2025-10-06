@@ -10,6 +10,9 @@
 (define-constant err-payout-already-processed (err u108))
 (define-constant err-insufficient-consensus (err u109))
 (define-constant err-oracle-already-registered (err u110))
+(define-constant err-stake-locked (err u111))
+(define-constant err-insufficient-stake (err u112))
+(define-constant err-no-rewards (err u113))
 
 (define-data-var next-policy-id uint u1)
 (define-data-var oracle-address principal tx-sender)
@@ -18,6 +21,10 @@
 (define-data-var max-payout-ratio uint u300)
 (define-data-var min-consensus-weight uint u100)
 (define-data-var total-oracle-weight uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var total-premium-fees uint u0)
+(define-data-var premium-fee-percentage uint u10)
+(define-data-var stake-lock-period uint u144)
 
 (define-map policies 
     { policy-id: uint }
@@ -82,6 +89,16 @@
     }
 )
 
+(define-map stakers
+    { staker: principal }
+    {
+        amount-staked: uint,
+        stake-block: uint,
+        last-claim-block: uint,
+        total-rewards-claimed: uint
+    }
+)
+
 (define-public (set-oracle-address (new-oracle principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -133,23 +150,27 @@
         
         (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
         
-        (map-set policies
-            { policy-id: policy-id }
-            {
-                policyholder: tx-sender,
-                premium-paid: premium,
-                coverage-amount: coverage-amount,
-                start-block: burn-block-height,
-                end-block: (+ burn-block-height duration-blocks),
-                trigger-condition: trigger-condition,
-                trigger-operator: trigger-operator,
-                status: "active",
-                payout-processed: false
-            }
+        (let ((premium-fee (/ (* premium (var-get premium-fee-percentage)) u100)))
+            (var-set total-premium-fees (+ (var-get total-premium-fees) premium-fee))
+            
+            (map-set policies
+                { policy-id: policy-id }
+                {
+                    policyholder: tx-sender,
+                    premium-paid: premium,
+                    coverage-amount: coverage-amount,
+                    start-block: burn-block-height,
+                    end-block: (+ burn-block-height duration-blocks),
+                    trigger-condition: trigger-condition,
+                    trigger-operator: trigger-operator,
+                    status: "active",
+                    payout-processed: false
+                }
+            )
+            
+            (var-set next-policy-id (+ policy-id u1))
+            (ok policy-id)
         )
-        
-        (var-set next-policy-id (+ policy-id u1))
-        (ok policy-id)
     )
 )
 
@@ -346,6 +367,87 @@
     )
 )
 
+(define-public (stake-liquidity (amount uint))
+    (let ((current-stake (map-get? stakers { staker: tx-sender })))
+        (asserts! (> amount u0) err-invalid-data)
+        (asserts! (>= (stx-get-balance tx-sender) amount) err-insufficient-funds)
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (if (is-some current-stake)
+            (let ((stake-info (unwrap-panic current-stake)))
+                (map-set stakers
+                    { staker: tx-sender }
+                    (merge stake-info { 
+                        amount-staked: (+ (get amount-staked stake-info) amount)
+                    })
+                )
+            )
+            (map-set stakers
+                { staker: tx-sender }
+                {
+                    amount-staked: amount,
+                    stake-block: burn-block-height,
+                    last-claim-block: burn-block-height,
+                    total-rewards-claimed: u0
+                }
+            )
+        )
+        
+        (var-set total-staked (+ (var-get total-staked) amount))
+        (ok amount)
+    )
+)
+
+(define-public (unstake-liquidity (amount uint))
+    (let 
+        (
+            (stake-info (unwrap! (map-get? stakers { staker: tx-sender }) err-not-found))
+            (lock-end (+ (get stake-block stake-info) (var-get stake-lock-period)))
+        )
+        (asserts! (> amount u0) err-invalid-data)
+        (asserts! (>= (get amount-staked stake-info) amount) err-insufficient-stake)
+        (asserts! (>= burn-block-height lock-end) err-stake-locked)
+        
+        (let ((new-stake (- (get amount-staked stake-info) amount)))
+            (if (is-eq new-stake u0)
+                (map-delete stakers { staker: tx-sender })
+                (map-set stakers
+                    { staker: tx-sender }
+                    (merge stake-info { amount-staked: new-stake })
+                )
+            )
+        )
+        
+        (var-set total-staked (- (var-get total-staked) amount))
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        (ok amount)
+    )
+)
+
+(define-public (claim-staking-rewards)
+    (let 
+        (
+            (stake-info (unwrap! (map-get? stakers { staker: tx-sender }) err-not-found))
+            (rewards (calculate-staker-rewards tx-sender))
+        )
+        (asserts! (> rewards u0) err-no-rewards)
+        (asserts! (>= (var-get total-premium-fees) rewards) err-insufficient-funds)
+        
+        (map-set stakers
+            { staker: tx-sender }
+            (merge stake-info { 
+                last-claim-block: burn-block-height,
+                total-rewards-claimed: (+ (get total-rewards-claimed stake-info) rewards)
+            })
+        )
+        
+        (var-set total-premium-fees (- (var-get total-premium-fees) rewards))
+        (try! (as-contract (stx-transfer? rewards tx-sender tx-sender)))
+        (ok rewards)
+    )
+)
+
 (define-read-only (calculate-premium (coverage-amount uint) (duration-blocks uint))
     (let 
         (
@@ -521,4 +623,53 @@
 
 (define-read-only (get-min-consensus-weight)
     (var-get min-consensus-weight)
+)
+
+(define-read-only (calculate-staker-rewards (staker principal))
+    (let 
+        (
+            (stake-info (map-get? stakers { staker: staker }))
+            (total-pool (var-get total-staked))
+        )
+        (if (and (is-some stake-info) (> total-pool u0))
+            (let 
+                (
+                    (info (unwrap-panic stake-info))
+                    (stake-share (/ (* (get amount-staked info) u1000000) total-pool))
+                    (available-fees (var-get total-premium-fees))
+                )
+                (/ (* available-fees stake-share) u1000000)
+            )
+            u0
+        )
+    )
+)
+
+(define-read-only (get-staker-info (staker principal))
+    (map-get? stakers { staker: staker })
+)
+
+(define-read-only (get-total-staked)
+    (var-get total-staked)
+)
+
+(define-read-only (get-total-premium-fees)
+    (var-get total-premium-fees)
+)
+
+(define-read-only (get-pool-apy)
+    (let 
+        (
+            (total-pool (var-get total-staked))
+            (total-fees (var-get total-premium-fees))
+        )
+        (if (> total-pool u0)
+            (/ (* total-fees u10000) total-pool)
+            u0
+        )
+    )
+)
+
+(define-read-only (get-stake-lock-period)
+    (var-get stake-lock-period)
 )
