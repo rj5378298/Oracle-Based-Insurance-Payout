@@ -245,6 +245,32 @@
     )
 )
 
+(define-public (extend-policy (policy-id uint) (additional-blocks uint))
+    (let 
+        (
+            (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+            (extension-premium (calculate-premium (get coverage-amount policy) additional-blocks))
+        )
+        (asserts! (> additional-blocks u0) err-invalid-data)
+        (asserts! (is-eq (get policyholder policy) tx-sender) err-owner-only)
+        (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+        (asserts! (not (get payout-processed policy)) err-payout-already-processed)
+        (asserts! (>= (stx-get-balance tx-sender) extension-premium) err-insufficient-funds)
+        (try! (stx-transfer? extension-premium tx-sender (as-contract tx-sender)))
+        (let ((premium-fee (/ (* extension-premium (var-get premium-fee-percentage)) u100)))
+            (var-set total-premium-fees (+ (var-get total-premium-fees) premium-fee))
+            (map-set policies
+                { policy-id: policy-id }
+                (merge policy {
+                    premium-paid: (+ (get premium-paid policy) extension-premium),
+                    end-block: (+ (get end-block policy) additional-blocks)
+                })
+            )
+            (ok (get end-block (unwrap-panic (map-get? policies { policy-id: policy-id }))))
+        )
+    )
+)
+
 (define-public (withdraw-funds (amount uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
