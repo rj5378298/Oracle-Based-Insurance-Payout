@@ -30,6 +30,7 @@
     { policy-id: uint }
     { 
         policyholder: principal,
+        beneficiary: principal,
         premium-paid: uint,
         coverage-amount: uint,
         start-block: uint,
@@ -157,6 +158,7 @@
                 { policy-id: policy-id }
                 {
                     policyholder: tx-sender,
+                    beneficiary: tx-sender,
                     premium-paid: premium,
                     coverage-amount: coverage-amount,
                     start-block: burn-block-height,
@@ -212,7 +214,7 @@
                         (merge policy { status: "paid-out", payout-processed: true })
                     )
                     
-                    (try! (as-contract (stx-transfer? payout-amount tx-sender (get policyholder policy))))
+                    (try! (as-contract (stx-transfer? payout-amount tx-sender (get beneficiary policy))))
                     (ok payout-amount)
                 )
                 (begin
@@ -378,7 +380,7 @@
                         (merge policy { status: "paid-out", payout-processed: true })
                     )
                     
-                    (try! (as-contract (stx-transfer? payout-amount tx-sender (get policyholder policy))))
+                    (try! (as-contract (stx-transfer? payout-amount tx-sender (get beneficiary policy))))
                     (ok payout-amount)
                 )
                 (begin
@@ -390,6 +392,22 @@
                 )
             )
         )
+    )
+)
+
+(define-public (set-policy-beneficiary (policy-id uint) (beneficiary principal))
+    (let 
+        (
+            (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+        )
+        (asserts! (is-eq (get policyholder policy) tx-sender) err-owner-only)
+        (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+        (asserts! (not (get payout-processed policy)) err-payout-already-processed)
+        (map-set policies
+            { policy-id: policy-id }
+            (merge policy { beneficiary: beneficiary })
+        )
+        (ok beneficiary)
     )
 )
 
@@ -536,6 +554,10 @@
 
 (define-read-only (get-policy (policy-id uint))
     (map-get? policies { policy-id: policy-id })
+)
+
+(define-read-only (get-policy-beneficiary (policy-id uint))
+    (get beneficiary (unwrap-panic (map-get? policies { policy-id: policy-id })))
 )
 
 (define-read-only (get-oracle-data (data-key (string-ascii 20)))
