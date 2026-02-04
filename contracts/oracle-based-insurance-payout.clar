@@ -721,3 +721,126 @@
 (define-read-only (get-stake-lock-period)
     (var-get stake-lock-period)
 )
+
+(define-constant err-escrow-not-found (err u114))
+(define-constant err-escrow-owner-only (err u115))
+(define-constant err-escrow-already-claimed (err u116))
+(define-constant err-escrow-insufficient (err u117))
+(define-constant err-escrow-policy-not-eligible (err u118))
+
+(define-map policy-escrows
+    { policy-id: uint }
+    {
+        depositor: principal,
+        escrow-amount: uint,
+        deposited-block: uint,
+        claimed: bool
+    }
+)
+
+(define-public (deposit-policy-escrow (policy-id uint) (amount uint))
+    (let 
+        (
+            (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+        )
+        (asserts! (> amount u0) err-invalid-data)
+        (asserts! (is-eq (get policyholder policy) tx-sender) err-owner-only)
+        (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+        (asserts! (not (get payout-processed policy)) err-payout-already-processed)
+        (asserts! (>= (stx-get-balance tx-sender) amount) err-insufficient-funds)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (let ((existing (map-get? policy-escrows { policy-id: policy-id })))
+            (if (is-some existing)
+                (let ((e (unwrap-panic existing)))
+                    (map-set policy-escrows
+                        { policy-id: policy-id }
+                        (merge e { escrow-amount: (+ (get escrow-amount e) amount) })
+                    )
+                )
+                (map-set policy-escrows
+                    { policy-id: policy-id }
+                    {
+                        depositor: tx-sender,
+                        escrow-amount: amount,
+                        deposited-block: burn-block-height,
+                        claimed: false
+                    }
+                )
+            )
+        )
+        (ok amount)
+    )
+)
+
+(define-read-only (get-policy-escrow (policy-id uint))
+    (map-get? policy-escrows { policy-id: policy-id })
+)
+
+(define-public (submit-escrow-claim (policy-id uint) (data-key (string-ascii 20)))
+    (let 
+        (
+            (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+            (escrow (unwrap! (map-get? policy-escrows { policy-id: policy-id }) err-escrow-not-found))
+            (oracle-info (unwrap! (map-get? oracle-data { data-key: data-key }) err-not-found))
+        )
+        (asserts! (is-eq (get policyholder policy) tx-sender) err-owner-only)
+        (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+        (asserts! (> (get end-block policy) burn-block-height) err-policy-expired)
+        (asserts! (not (get payout-processed policy)) err-payout-already-processed)
+        (asserts! (not (get claimed escrow)) err-escrow-already-claimed)
+        (let ((condition-met (evaluate-condition (get value oracle-info) (get trigger-condition policy) (get trigger-operator policy))))
+            (if condition-met
+                (let 
+                    (
+                        (payout-amount (calculate-payout-amount policy-id (get value oracle-info)))
+                        (available-escrow (get escrow-amount escrow))
+                    )
+                    (asserts! (>= available-escrow payout-amount) err-escrow-insufficient)
+                    (asserts! (>= (stx-get-balance (as-contract tx-sender)) payout-amount) err-insufficient-funds)
+                    (map-set policy-claims
+                        { policy-id: policy-id }
+                        {
+                            claim-amount: payout-amount,
+                            claim-timestamp: burn-block-height,
+                            data-used: (get value oracle-info),
+                            processed: true
+                        }
+                    )
+                    (map-set policies
+                        { policy-id: policy-id }
+                        (merge policy { status: "paid-out", payout-processed: true })
+                    )
+                    (map-set policy-escrows
+                        { policy-id: policy-id }
+                        (merge escrow { escrow-amount: (- available-escrow payout-amount), claimed: true })
+                    )
+                    (try! (as-contract (stx-transfer? payout-amount tx-sender (get beneficiary policy))))
+                    (ok payout-amount)
+                )
+                (begin
+                    (ok u0)
+                )
+            )
+        )
+    )
+)
+
+(define-public (refund-policy-escrow (policy-id uint) (amount uint))
+    (let 
+        (
+            (escrow (unwrap! (map-get? policy-escrows { policy-id: policy-id }) err-escrow-not-found))
+            (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+            (refundable (get escrow-amount escrow))
+        )
+        (asserts! (is-eq (get depositor escrow) tx-sender) err-escrow-owner-only)
+        (asserts! (> amount u0) err-invalid-data)
+        (asserts! (<= amount refundable) err-insufficient-funds)
+        (asserts! (or (>= burn-block-height (get end-block policy)) (not (is-eq (get status policy) "active")) (get payout-processed policy)) err-escrow-policy-not-eligible)
+        (map-set policy-escrows
+            { policy-id: policy-id }
+            (merge escrow { escrow-amount: (- refundable amount) })
+        )
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        (ok amount)
+    )
+)
